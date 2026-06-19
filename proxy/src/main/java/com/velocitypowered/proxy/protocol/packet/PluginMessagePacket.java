@@ -23,12 +23,16 @@ import com.velocitypowered.api.network.ProtocolVersion;
 import com.velocitypowered.proxy.connection.MinecraftSessionHandler;
 import com.velocitypowered.proxy.protocol.MinecraftPacket;
 import com.velocitypowered.proxy.protocol.ProtocolUtils;
+import com.velocitypowered.proxy.protocol.ProtocolUtils.Direction;
 import com.velocitypowered.proxy.protocol.util.DeferredByteBufHolder;
 import io.netty.buffer.ByteBuf;
 import org.checkerframework.checker.nullness.qual.MonotonicNonNull;
 import org.checkerframework.checker.nullness.qual.Nullable;
 
 public class PluginMessagePacket extends DeferredByteBufHolder implements MinecraftPacket {
+
+  private static final int MAX_PAYLOAD_SIZE_CLIENTBOUND = getPayloadLimit(Direction.CLIENTBOUND);
+  private static final int MAX_PAYLOAD_SIZE_SERVERBOUND = getPayloadLimit(Direction.SERVERBOUND);
 
   private @Nullable String channel;
 
@@ -47,6 +51,19 @@ public class PluginMessagePacket extends DeferredByteBufHolder implements Minecr
       throw new IllegalStateException("Channel is not specified.");
     }
     return channel;
+  }
+
+  private static int getPayloadLimit(Direction direction) {
+    if (System.getProperty("velocity.max-plugin-message-payload-size") != null) {
+      return Integer.getInteger("velocity.max-plugin-message-payload-size");
+    }
+    if (direction == Direction.SERVERBOUND) {
+      return Integer.getInteger("velocity.max-plugin-message-payload-size.serverbound", 32767);
+    } else {
+      // This is the vanilla expected limit, a payload this large feels like a nightmare given the trust
+      // we give to servers...
+      return Integer.getInteger("velocity.max-plugin-message-payload-size.clientbound", 1048576);
+    }
   }
 
   public void setChannel(String channel) {
@@ -100,6 +117,17 @@ public class PluginMessagePacket extends DeferredByteBufHolder implements Minecr
   }
 
   @Override
+  public int decodeExpectedMaxLength(ByteBuf buf, Direction direction, ProtocolVersion version) {
+    return ProtocolUtils.DEFAULT_MAX_STRING_BYTES +
+        (direction == Direction.CLIENTBOUND ? MAX_PAYLOAD_SIZE_CLIENTBOUND : MAX_PAYLOAD_SIZE_SERVERBOUND);
+  }
+
+  @Override
+  public int decodeExpectedMinLength(ByteBuf buf, Direction direction, ProtocolVersion version) {
+    return 1 + 0 + 0;
+  }
+
+  @Override
   public boolean handle(MinecraftSessionHandler handler) {
     return handler.handle(this);
   }
@@ -142,5 +170,10 @@ public class PluginMessagePacket extends DeferredByteBufHolder implements Minecr
   @Override
   public PluginMessagePacket touch(Object hint) {
     return (PluginMessagePacket) super.touch(hint);
+  }
+
+  @Override
+  public int encodeSizeHint(Direction direction, ProtocolVersion version) {
+    return content().readableBytes();
   }
 }

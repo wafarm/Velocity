@@ -21,10 +21,10 @@ import static com.velocitypowered.proxy.protocol.util.PluginMessageUtil.construc
 
 import com.google.common.collect.ImmutableList;
 import com.mojang.brigadier.suggestion.Suggestion;
-import com.velocitypowered.api.command.VelocityBrigadierMessage;
 import com.velocitypowered.api.event.connection.PluginMessageEvent;
 import com.velocitypowered.api.event.player.CookieReceiveEvent;
 import com.velocitypowered.api.event.player.PlayerChannelRegisterEvent;
+import com.velocitypowered.api.event.player.PlayerChannelUnregisterEvent;
 import com.velocitypowered.api.event.player.PlayerClientBrandEvent;
 import com.velocitypowered.api.event.player.TabCompleteEvent;
 import com.velocitypowered.api.event.player.configuration.PlayerEnteredConfigurationEvent;
@@ -41,6 +41,7 @@ import com.velocitypowered.proxy.connection.forge.legacy.LegacyForgeConstants;
 import com.velocitypowered.proxy.connection.player.resourcepack.ResourcePackResponseBundle;
 import com.velocitypowered.proxy.protocol.MinecraftPacket;
 import com.velocitypowered.proxy.protocol.StateRegistry;
+import com.velocitypowered.proxy.protocol.netty.MinecraftDecoder;
 import com.velocitypowered.proxy.protocol.packet.BossBarPacket;
 import com.velocitypowered.proxy.protocol.packet.ClientSettingsPacket;
 import com.velocitypowered.proxy.protocol.packet.JoinGamePacket;
@@ -85,8 +86,11 @@ import java.util.Queue;
 import java.util.UUID;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ConcurrentLinkedQueue;
+import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.atomic.AtomicLong;
 import net.kyori.adventure.key.Key;
 import net.kyori.adventure.text.Component;
+import net.kyori.adventure.text.ComponentLike;
 import net.kyori.adventure.text.format.NamedTextColor;
 import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
@@ -97,6 +101,16 @@ import org.checkerframework.checker.nullness.qual.Nullable;
  * center that joins backend servers with players.
  */
 public class ClientPlaySessionHandler implements MinecraftSessionHandler {
+  private static final boolean BACKPRESSURE_LOG =
+      Boolean.getBoolean("velocity.log-server-backpressure");
+
+  // Caps the per-connection queue used while the FML/login phases are not yet "complete". Without
+  // these caps, a client that never completes its handshake phase can spam plugin messages (each up
+  // to ~32 KiB serverbound) and grow the queue without bound.
+  private static final long MAX_QUEUED_LOGIN_PLUGIN_MESSAGE_BYTES =
+      Long.getLong("velocity.max-queued-login-plugin-message-bytes", 4L * 1024 * 1024);
+  private static final int MAX_QUEUED_LOGIN_PLUGIN_MESSAGES =
+      Integer.getInteger("velocity.max-queued-login-plugin-messages", 1024);
 
   private static final Logger logger = LogManager.getLogger(ClientPlaySessionHandler.class);
 
@@ -104,6 +118,9 @@ public class ClientPlaySessionHandler implements MinecraftSessionHandler {
   private boolean spawned = false;
   private final List<UUID> serverBossBars = new ArrayList<>();
   private final Queue<PluginMessagePacket> loginPluginMessages = new ConcurrentLinkedQueue<>();
+  private final AtomicLong loginPluginMessagesBytes = new AtomicLong();
+  private final AtomicInteger loginPluginMessagesCount = new AtomicInteger();
+  private volatile boolean loginPluginMessagesOverflowed;
   private final VelocityServer server;
   private @Nullable TabCompleteRequestPacket outstandingTabComplete;
   private final ChatHandler<? extends MinecraftPacket> chatHandler;
@@ -172,9 +189,38 @@ public class ClientPlaySessionHandler implements MinecraftSessionHandler {
   @Override
   public void deactivated() {
     player.discardChatQueue();
-    for (PluginMessagePacket message : loginPluginMessages) {
+    PluginMessagePacket message;
+    while ((message = loginPluginMessages.poll()) != null) {
       ReferenceCountUtil.release(message);
     }
+    loginPluginMessagesBytes.set(0);
+    loginPluginMessagesCount.set(0);
+  }
+
+  /**
+   * Adds a retained plugin message to the queue used while the FML/login phases are still in
+   * progress, enforcing the per-connection byte and count caps. Returns {@code true} if queued,
+   * {@code false} if the packet was released (and the player disconnected on overflow).
+   */
+  private boolean enqueueLoginPluginMessage(PluginMessagePacket packet) {
+    if (loginPluginMessagesOverflowed) {
+      ReferenceCountUtil.release(packet);
+      return false;
+    }
+    int packetSize = packet.content().readableBytes();
+    long newBytes = loginPluginMessagesBytes.addAndGet(packetSize);
+    int newCount = loginPluginMessagesCount.incrementAndGet();
+    if (newBytes > MAX_QUEUED_LOGIN_PLUGIN_MESSAGE_BYTES
+        || newCount > MAX_QUEUED_LOGIN_PLUGIN_MESSAGES) {
+      loginPluginMessagesOverflowed = true;
+      ReferenceCountUtil.release(packet);
+      logger.warn("Disconnecting {}: pre-join plugin-message queue exceeded its limits "
+              + "({} messages, {} bytes).", player, newCount, newBytes);
+      player.disconnect(Component.translatable("velocity.error.plugin-message-overflow"));
+      return false;
+    }
+    loginPluginMessages.add(packet);
+    return true;
   }
 
   @Override
@@ -318,8 +364,12 @@ public class ClientPlaySessionHandler implements MinecraftSessionHandler {
                 new PlayerChannelRegisterEvent(player, ImmutableList.copyOf(channels)));
         backendConn.write(packet.retain());
       } else if (PluginMessageUtil.isUnregister(packet)) {
-        player.getClientsideChannels()
-            .removeAll(PluginMessageUtil.getChannels(0, packet, this.player.getProtocolVersion()));
+        List<ChannelIdentifier> channels =
+            PluginMessageUtil.getChannels(0, packet, this.player.getProtocolVersion());
+        player.getClientsideChannels().removeAll(channels);
+        server.getEventManager()
+            .fireAndForget(
+                new PlayerChannelUnregisterEvent(player, ImmutableList.copyOf(channels)));
         backendConn.write(packet.retain());
       } else if (PluginMessageUtil.isMcBrand(packet)) {
         String brand = PluginMessageUtil.readBrandMessage(packet.content());
@@ -351,7 +401,7 @@ public class ClientPlaySessionHandler implements MinecraftSessionHandler {
               //
               // We also need to make sure to retain these packets, so they can be flushed
               // appropriately.
-              loginPluginMessages.add(packet.retain());
+              enqueueLoginPluginMessage(packet.retain());
             } else {
               // The connection is ready, send the packet now.
               backendConn.write(packet.retain());
@@ -366,7 +416,7 @@ public class ClientPlaySessionHandler implements MinecraftSessionHandler {
                 if (!player.getPhase().consideredComplete() || !serverConn.getPhase()
                     .consideredComplete()) {
                   // We're still processing the connection (see above), enqueue the packet for now.
-                  loginPluginMessages.add(message.retain());
+                  enqueueLoginPluginMessage(message.retain());
                 } else {
                   backendConn.write(message);
                 }
@@ -463,7 +513,11 @@ public class ClientPlaySessionHandler implements MinecraftSessionHandler {
     }
 
     MinecraftConnection smc = serverConnection.getConnection();
-    if (smc != null && serverConnection.getPhase().consideredComplete()) {
+    final boolean stateAllowsForward = smc != null
+        && !smc.isClosed()
+        && serverConnection.getPhase().consideredComplete()
+        && smc.getState() == StateRegistry.PLAY;
+    if (stateAllowsForward) {
       if (packet instanceof PluginMessagePacket) {
         ((PluginMessagePacket) packet).retain();
       }
@@ -480,7 +534,11 @@ public class ClientPlaySessionHandler implements MinecraftSessionHandler {
     }
 
     MinecraftConnection smc = serverConnection.getConnection();
-    if (smc != null && !smc.isClosed() && serverConnection.getPhase().consideredComplete()) {
+    final boolean stateAllowsForward = smc != null
+        && !smc.isClosed()
+        && serverConnection.getPhase().consideredComplete()
+        && smc.getState() == StateRegistry.PLAY;
+    if (stateAllowsForward) {
       smc.write(buf.retain());
     }
   }
@@ -492,13 +550,23 @@ public class ClientPlaySessionHandler implements MinecraftSessionHandler {
 
   @Override
   public void exception(Throwable throwable) {
-    player.disconnect(
-        Component.translatable("velocity.error.player-connection-error", NamedTextColor.RED));
+    player.disconnect(Component.translatable("velocity.error.player-connection-error", NamedTextColor.RED));
+    if (MinecraftDecoder.DEBUG) {
+      logger.info("Exception while handling packet for {}", player, throwable);
+    }
   }
 
   @Override
   public void writabilityChanged() {
     boolean writable = player.getConnection().getChannel().isWritable();
+
+    if (BACKPRESSURE_LOG) {
+      if (writable) {
+        logger.info("{} is writable, will auto-read backend connection data", player);
+      } else {
+        logger.info("{} is not writable, not auto-reading backend connection data", player);
+      }
+    }
 
     if (!writable) {
       // We might have packets queued from the server, so flush them now to free up memory. Make
@@ -535,9 +603,13 @@ public class ClientPlaySessionHandler implements MinecraftSessionHandler {
 
       // Config state clears everything in the client. No need to clear later.
       spawned = false;
-      serverBossBars.clear();
       player.clearPlayerListHeaderAndFooterSilent();
       player.getTabList().clearAllSilent();
+      if (player.getProtocolVersion().noLessThan(ProtocolVersion.MINECRAFT_1_20_2)) {
+        player.getBossBarManager().dropPackets();
+      } else {
+        serverBossBars.clear();
+      }
     }
 
     player.switchToConfigState();
@@ -575,15 +647,20 @@ public class ClientPlaySessionHandler implements MinecraftSessionHandler {
       }
     }
 
-    // Remove previous boss bars. These don't get cleared when sending JoinGame, thus the need to
-    // track them.
-    for (UUID serverBossBar : serverBossBars) {
-      BossBarPacket deletePacket = new BossBarPacket();
-      deletePacket.setUuid(serverBossBar);
-      deletePacket.setAction(BossBarPacket.REMOVE);
-      player.getConnection().delayedWrite(deletePacket);
+    destination.setEntityId(joinGame.getEntityId()); // used for sound api
+    if (player.getProtocolVersion().noLessThan(ProtocolVersion.MINECRAFT_1_20_2)) {
+      player.getBossBarManager().sendBossBars();
+    } else {
+      // Remove previous boss bars. These don't get cleared when sending JoinGame (up until 1.20.2),
+      // thus the need to track them.
+      for (UUID serverBossBar : serverBossBars) {
+        BossBarPacket deletePacket = new BossBarPacket();
+        deletePacket.setUuid(serverBossBar);
+        deletePacket.setAction(BossBarPacket.REMOVE);
+        player.getConnection().delayedWrite(deletePacket);
+      }
+      serverBossBars.clear();
     }
-    serverBossBars.clear();
 
     // Tell the server about the proxy's plugin message channels.
     ProtocolVersion serverVersion = serverMc.getProtocolVersion();
@@ -602,6 +679,8 @@ public class ClientPlaySessionHandler implements MinecraftSessionHandler {
     while ((pm = loginPluginMessages.poll()) != null) {
       serverMc.delayedWrite(pm);
     }
+    loginPluginMessagesBytes.set(0);
+    loginPluginMessagesCount.set(0);
 
     // Clear any title from the previous server.
     if (player.getProtocolVersion().noLessThan(ProtocolVersion.MINECRAFT_1_8)) {
@@ -694,23 +773,35 @@ public class ClientPlaySessionHandler implements MinecraftSessionHandler {
             return;
           }
 
-          List<Offer> offers = new ArrayList<>();
-          for (Suggestion suggestion : suggestions.getList()) {
-            String offer = suggestion.getText();
-            ComponentHolder tooltip = null;
-            if (suggestion.getTooltip() != null
-                && suggestion.getTooltip() instanceof VelocityBrigadierMessage) {
-              tooltip = new ComponentHolder(player.getProtocolVersion(),
-                  ((VelocityBrigadierMessage) suggestion.getTooltip()).asComponent());
+          int startPos = -1;
+          for (var suggestion : suggestions.getList()) {
+            if (startPos == -1 || startPos > suggestion.getRange().getStart()) {
+              startPos = suggestion.getRange().getStart();
             }
-            offers.add(new Offer(offer, tooltip));
           }
-          int startPos = packet.getCommand().lastIndexOf(' ') + 1;
+
           if (startPos > 0) {
+            List<Offer> offers = new ArrayList<>();
+            for (Suggestion suggestion : suggestions.getList()) {
+              String offer;
+              if (suggestion.getRange().getStart() == startPos) {
+                offer = suggestion.getText();
+              } else {
+                offer = command.substring(startPos, suggestion.getRange().getStart()) + suggestion.getText();
+              }
+              ComponentHolder tooltip = null;
+              if (suggestion.getTooltip() instanceof ComponentLike componentLike) {
+                tooltip = new ComponentHolder(player.getProtocolVersion(), componentLike.asComponent());
+              } else if (suggestion.getTooltip() != null) {
+                tooltip = new ComponentHolder(player.getProtocolVersion(), Component.text(suggestion.getTooltip().getString()));
+              }
+              offers.add(new Offer(offer, tooltip));
+            }
+
             TabCompleteResponsePacket resp = new TabCompleteResponsePacket();
             resp.setTransactionId(packet.getTransactionId());
-            resp.setStart(startPos);
-            resp.setLength(packet.getCommand().length() - startPos);
+            resp.setStart(startPos + 1);
+            resp.setLength(packet.getCommand().length() - startPos - 1);
             resp.getOffers().addAll(offers);
             player.getConnection().write(resp);
           }
@@ -765,10 +856,10 @@ public class ClientPlaySessionHandler implements MinecraftSessionHandler {
                 offer = offer.substring(command.length());
               }
               ComponentHolder tooltip = null;
-              if (suggestion.getTooltip() != null
-                  && suggestion.getTooltip() instanceof VelocityBrigadierMessage) {
-                tooltip = new ComponentHolder(player.getProtocolVersion(),
-                    ((VelocityBrigadierMessage) suggestion.getTooltip()).asComponent());
+              if (suggestion.getTooltip() instanceof ComponentLike componentLike) {
+                tooltip = new ComponentHolder(player.getProtocolVersion(), componentLike.asComponent());
+              } else if (suggestion.getTooltip() != null) {
+                tooltip = new ComponentHolder(player.getProtocolVersion(), Component.text(suggestion.getTooltip().getString()));
               }
               response.getOffers().add(new Offer(offer, tooltip));
             }
@@ -822,6 +913,8 @@ public class ClientPlaySessionHandler implements MinecraftSessionHandler {
         while ((pm = loginPluginMessages.poll()) != null) {
           connection.write(pm);
         }
+        loginPluginMessagesBytes.set(0);
+        loginPluginMessagesCount.set(0);
       }
     }
   }

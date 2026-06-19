@@ -47,6 +47,7 @@ import com.velocitypowered.proxy.connection.util.ConnectionMessages;
 import com.velocitypowered.proxy.protocol.MinecraftPacket;
 import com.velocitypowered.proxy.protocol.StateRegistry;
 import com.velocitypowered.proxy.protocol.netty.MinecraftDecoder;
+import com.velocitypowered.proxy.protocol.netty.MinecraftVarintFrameDecoder;
 import com.velocitypowered.proxy.protocol.packet.AvailableCommandsPacket;
 import com.velocitypowered.proxy.protocol.packet.BossBarPacket;
 import com.velocitypowered.proxy.protocol.packet.BundleDelimiterPacket;
@@ -67,6 +68,7 @@ import com.velocitypowered.proxy.protocol.packet.TransferPacket;
 import com.velocitypowered.proxy.protocol.packet.UpsertPlayerInfoPacket;
 import com.velocitypowered.proxy.protocol.packet.chat.ComponentHolder;
 import com.velocitypowered.proxy.protocol.packet.config.StartUpdatePacket;
+import com.velocitypowered.proxy.protocol.util.DeferredByteBufHolder;
 import com.velocitypowered.proxy.protocol.util.PluginMessageUtil;
 import io.netty.buffer.ByteBuf;
 import io.netty.buffer.ByteBufUtil;
@@ -90,6 +92,7 @@ public class BackendPlaySessionHandler implements MinecraftSessionHandler {
       Boolean.getBoolean("velocity.log-server-backpressure");
   private static final int MAXIMUM_PACKETS_TO_FLUSH =
       Integer.getInteger("velocity.max-packets-per-flush", 8192);
+  private static final int LARGE_PACKET_THRESHOLD = 1024 * 128;
 
   private final VelocityServer server;
   private final VelocityServerConnection serverConn;
@@ -149,6 +152,7 @@ public class BackendPlaySessionHandler implements MinecraftSessionHandler {
     MinecraftConnection smc = serverConn.ensureConnected();
     smc.setAutoReading(false);
     // Even when not auto reading messages are still decoded. Decode them with the correct state
+    smc.getChannel().pipeline().get(MinecraftVarintFrameDecoder.class).setState(StateRegistry.CONFIG);
     smc.getChannel().pipeline().get(MinecraftDecoder.class).setState(StateRegistry.CONFIG);
     serverConn.getPlayer().switchToConfigState();
     return true;
@@ -175,10 +179,12 @@ public class BackendPlaySessionHandler implements MinecraftSessionHandler {
 
   @Override
   public boolean handle(BossBarPacket packet) {
-    if (packet.getAction() == BossBarPacket.ADD) {
-      playerSessionHandler.getServerBossBars().add(packet.getUuid());
-    } else if (packet.getAction() == BossBarPacket.REMOVE) {
-      playerSessionHandler.getServerBossBars().remove(packet.getUuid());
+    if (serverConn.getPlayer().getProtocolVersion().lessThan(ProtocolVersion.MINECRAFT_1_20_2)) {
+      if (packet.getAction() == BossBarPacket.ADD) {
+        playerSessionHandler.getServerBossBars().add(packet.getUuid());
+      } else if (packet.getAction() == BossBarPacket.REMOVE) {
+        playerSessionHandler.getServerBossBars().remove(packet.getUuid());
+      }
     }
     return false; // forward
   }
@@ -357,7 +363,12 @@ public class BackendPlaySessionHandler implements MinecraftSessionHandler {
       // Inject commands from the proxy.
       final CommandGraphInjector<CommandSource> injector = server.getCommandManager().getInjector();
       injector.inject(rootNode, serverConn.getPlayer());
-      rootNode.removeChildByName("velocity:callback");
+
+      // In 1.21.6 a confirmation prompt was added when executing a command via `run_command` click
+      // action if the command is unknown. To prevent this prompt we have to send the command.
+      if (this.playerConnection.getProtocolVersion().lessThan(ProtocolVersion.MINECRAFT_1_21_6)) {
+        rootNode.removeChildByName("velocity:callback");
+      }
     }
 
     server.getEventManager().fire(
@@ -443,11 +454,12 @@ public class BackendPlaySessionHandler implements MinecraftSessionHandler {
 
   @Override
   public void handleGeneric(MinecraftPacket packet) {
-    if (packet instanceof PluginMessagePacket) {
-      ((PluginMessagePacket) packet).retain();
+    if (packet instanceof PluginMessagePacket pluginMessage) {
+      pluginMessage.retain();
     }
+    boolean huge = packet instanceof DeferredByteBufHolder def && def.content().readableBytes() > LARGE_PACKET_THRESHOLD;
     playerConnection.delayedWrite(packet);
-    if (++packetsFlushed >= MAXIMUM_PACKETS_TO_FLUSH) {
+    if (huge || ++packetsFlushed >= MAXIMUM_PACKETS_TO_FLUSH) {
       playerConnection.flush();
       packetsFlushed = 0;
     }
@@ -455,8 +467,9 @@ public class BackendPlaySessionHandler implements MinecraftSessionHandler {
 
   @Override
   public void handleUnknown(ByteBuf buf) {
+    boolean huge = buf.readableBytes() > LARGE_PACKET_THRESHOLD;
     playerConnection.delayedWrite(buf.retain());
-    if (++packetsFlushed >= MAXIMUM_PACKETS_TO_FLUSH) {
+    if (huge || ++packetsFlushed >= MAXIMUM_PACKETS_TO_FLUSH) {
       playerConnection.flush();
       packetsFlushed = 0;
     }

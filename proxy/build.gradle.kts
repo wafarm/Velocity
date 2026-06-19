@@ -1,14 +1,16 @@
 import com.github.jengelman.gradle.plugins.shadow.transformers.Log4j2PluginsCacheFileTransformer
+import io.papermc.fill.model.BuildChannel
 
 plugins {
     application
     id("velocity-init-manifest")
     alias(libs.plugins.shadow)
+    alias(libs.plugins.fill)
 }
 
 application {
     mainClass.set("com.velocitypowered.proxy.Velocity")
-    applicationDefaultJvmArgs += listOf("-Dvelocity.packet-decode-logging=true");
+    applicationDefaultJvmArgs += listOf("-Dvelocity.packet-decode-logging=true")
 }
 
 tasks {
@@ -25,6 +27,10 @@ tasks {
     }
 
     shadowJar {
+        filesMatching("META-INF/org/apache/logging/log4j/core/config/plugins/**") {
+            duplicatesStrategy = DuplicatesStrategy.INCLUDE
+        }
+
         transform(Log4j2PluginsCacheFileTransformer::class.java)
 
         // Exclude all the collection types we don"t intend to use
@@ -100,6 +106,7 @@ tasks {
     runShadow {
         workingDir = file("run").also(File::mkdirs)
         standardInput = System.`in`
+        jvmArgs("-Dvelocity.packet-decode-logging=true")
     }
     named<JavaExec>("run") {
         workingDir = file("run").also(File::mkdirs)
@@ -107,10 +114,27 @@ tasks {
     }
 }
 
+val projectVersion = version as String
+fill {
+    project("velocity")
+
+    build {
+        channel = BuildChannel.STABLE
+        versionFamily("3.0.0")
+        version(projectVersion)
+
+        downloads {
+            register("server:default") {
+                file = tasks.shadowJar.flatMap { it.archiveFile }
+                nameResolver.set { project, _, version, build -> "$project-$version-$build.jar" }
+            }
+        }
+    }
+}
+
 dependencies {
     implementation(project(":velocity-api"))
     implementation(project(":velocity-native"))
-    implementation(project(":velocity-proxy-log4j2-plugin"))
 
     implementation(libs.bundles.log4j)
     implementation(libs.kyori.ansi)
@@ -147,4 +171,5 @@ dependencies {
     testImplementation(libs.mockito)
 
     annotationProcessor(libs.auto.service)
+    annotationProcessor(libs.log4j.core)
 }
